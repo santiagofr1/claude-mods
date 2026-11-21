@@ -1,0 +1,1 @@
+{ "name": "estado-uso", "version": "0.2.0", "description": "Línea bajo el prompt: modelo, contexto, límites 5h/7d, costo de hoy y de la semana", "types": "./types/index.d.ts" }
