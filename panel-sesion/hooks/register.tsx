@@ -258,6 +258,7 @@ async function cargarHistorial($: EngineInterface, raiz: string) {
     const rl = await $.process.run(['git', 'rev-list', '--branches', '--not', '--remotes'], opts)
     sinPush = new Set(rl.stdout.split('\n').filter(Boolean))
   }
+  const nombresRemotos = remotos.stdout.split('\n').map(x => x.trim()).filter(Boolean)
   const commits: Commit[] = []
   for (const reg of log.stdout.split('\x1e')) {
     if (!reg.trim()) continue
@@ -270,7 +271,7 @@ async function cargarHistorial($: EngineInterface, raiz: string) {
       autor,
       fecha: Number(fecha) * 1000,
       asunto,
-      refs: refs.split(', ').map(r => r.trim()).filter(r => r && r !== 'origin/HEAD' && !r.endsWith('/HEAD')),
+      refs: clasificar(refs, nombresRemotos),
       sinPush: sinPush.has(hash),
     }
     const n = /(\d+) files? changed/.exec(st)
@@ -282,6 +283,29 @@ async function cargarHistorial($: EngineInterface, raiz: string) {
     commits.push(c)
   }
   await update($, historial, () => commits)
+}
+
+// "HEAD -> main, origin/main, tag: v1" → chips; la local y su remota en el mismo commit van juntas
+function clasificar(d: string, remotos: string[]): Commit['refs'] {
+  const out: Commit['refs'] = []
+  const remotas: string[] = []
+  for (const r0 of d.split(', ')) {
+    const r = r0.trim()
+    if (!r || r.endsWith('/HEAD')) continue
+    if (r === 'HEAD') out.push({ t: 'suelto', n: 'HEAD' })
+    else if (r.startsWith('HEAD -> ')) out.push({ t: 'head', n: r.slice(8) })
+    else if (r.startsWith('tag: ')) out.push({ t: 'tag', n: r.slice(5) })
+    else if (remotos.some(x => r.startsWith(x + '/'))) remotas.push(r)
+    else out.push({ t: 'rama', n: r })
+  }
+  for (const r of remotas) {
+    const corto = r.slice(r.indexOf('/') + 1)
+    const local = out.find(x => (x.t === 'rama' || x.t === 'head') && x.n === corto)
+    if (local) local.sync = true
+    else out.push({ t: 'remota', n: r })
+  }
+  const orden = { head: 0, suelto: 0, rama: 1, remota: 2, tag: 3 }
+  return out.sort((a, b) => orden[a.t] - orden[b.t])
 }
 
 async function cargarCommit($: EngineInterface, raiz: string, hash: string) {
@@ -804,7 +828,7 @@ export const register: Register = on => {
               <Text bold>  {c?.asunto ?? ''}</Text>
             </Text>
             {c ? <Text dimColor>{c.autor} · {haceFecha(c.fecha, ahora)} ago{c.archivos !== undefined ? ` · ${c.archivos} files ` : ''}{c.mas !== undefined ? <Text color="success">+{c.mas} </Text> : null}{c.menos !== undefined ? <Text color="error">−{c.menos}</Text> : null}</Text> : null}
-            {c && c.refs.length ? <Text wrap="truncate-end">{c.refs.map(r => `[${r}]`).join(' ')}</Text> : null}
+            {c && c.refs.length ? <Text wrap="truncate-end" dimColor>{c.refs.map(r => r.n).join('  ')}</Text> : null}
           </Box>
           {dc ? (
             <Box flexDirection="column">
@@ -1008,58 +1032,73 @@ export const register: Register = on => {
 
         {g && hist.length > 0 ? (() => {
           const filas = armarGrafo(hist)
-          const anchoG = Math.min(16, Math.max(2, ...filas.map(f => Math.max(f.nodo.length, f.antes?.length ?? 0, f.despues?.length ?? 0))))
-          const dibujar = (celdas: Celda[], k: string) => (
-            <Text key={k}>{tramos(celdas, anchoG).map((t, i) => <Text key={`${k}-${i}`} color={t.color} bold={t.bold}>{t.ch}</Text>)}</Text>
+          const anchoG = Math.min(14, Math.max(2, ...filas.map(f => Math.max(f.nodo.length, f.antes?.length ?? 0, f.despues?.length ?? 0)))) + 1
+          const anchoTxt = Math.max(10, ancho - anchoG)
+          const lineas = (celdas: Celda[], k: string) => (
+            <Box key={k} width={anchoG} flexShrink={0}>
+              <Text wrap="truncate-end">{tramos(celdas, anchoG).map((t, i) => <Text key={`${k}-${i}`} color={t.color} bold={t.bold}>{t.ch}</Text>)}</Text>
+            </Box>
           )
-          const etiqueta = (r: string, color: string) => {
-            if (r.startsWith('HEAD -> ')) return <Text key={r} color="inverseText" backgroundColor={color} bold>{` ${r.slice(8)} `}</Text>
-            if (r.startsWith('tag: ')) return <Text key={r} color="warning" bold>{`◆${r.slice(5)}`}</Text>
-            if (r === 'HEAD') return <Text key={r} color="inverseText" backgroundColor="warning" bold> HEAD </Text>
-            if (r.includes('/')) return <Text key={r} color={color} dimColor>{`☁${r}`}</Text>
-            return <Text key={r} color={color} bold>{`[${r}]`}</Text>
-          }
+          const largoRef = (r: Commit['refs'][number]) => r.n.length + (r.t === 'head' ? 3 : r.t === 'tag' ? 2 : 1)
+          const etiqueta = (r: Commit['refs'][number], color: string) =>
+            r.t === 'head' ? <Text key={r.n} color="inverseText" backgroundColor={color} bold>{` ${r.n} `}</Text>
+            : r.t === 'suelto' ? <Text key={r.n} color="inverseText" backgroundColor="warning" bold> HEAD </Text>
+            : r.t === 'tag' ? <Text key={r.n} color="warning" bold>{`◆${r.n}`}</Text>
+            : r.t === 'remota' ? <Text key={r.n} color={color} dimColor>{r.n}</Text>
+            : <Text key={r.n} color={color} bold>{r.n}</Text>
           return (
             <Box marginTop={1} flexDirection="column">
               {regla('HISTORY', `${hist.length} commits · ○ not pushed`)}
               {filas.map((f, i) => {
                 const c = hist[i]!
-                const refsTxt = c.refs.join(' ').length + c.refs.length * 2
-                const lugar = Math.max(6, ancho - anchoG - refsTxt - 6)
-                // La tarjeta sale abajo, salvo en las últimas filas, donde sale arriba
-                const arriba = i > filas.length - 8
+                const refs = c.refs.slice(0, 3)
+                const lugar = Math.max(6, anchoTxt - refs.reduce((n, r) => n + largoRef(r) + 1, 0) - 5)
                 return (
                   <Box key={`h-${c.hash}`} flexDirection="column">
-                    {f.antes ? dibujar(f.antes, `ha-${c.hash}`) : null}
-                    <Box key={`hr-${c.hash}`} flexDirection="row" hover={{ backgroundColor: '#2a2f3a' }}>
-                      {dibujar(f.nodo, `hn-${c.hash}`)}
-                      <Button key={`hb-${c.hash}`} onPress={() => {
-                        void update($, detalleCommit, () => null)
-                        void update($, seleccion, () => ({ tipo: 'hist', id: c.hash }))
-                        void cargarCommit($, g.raiz, c.hash)
-                      }}>
-                        <Text wrap="truncate-end">
-                          {c.refs.map(r => <Text key={`e-${r}`}>{etiqueta(r, f.color)} </Text>)}
-                          <Text>{recortar(c.asunto, lugar)}</Text>
-                          <Text color="subtle"> {haceFecha(c.fecha, ahora)}</Text>
-                        </Text>
-                      </Button>
-                      <Box position="absolute" top={arriba ? -7 : 1} left={anchoG + 2} display="none" hover={{ display: 'flex' }}
-                        borderStyle="round" borderColor={f.color} backgroundColor="#1b1f27" paddingX={1} flexDirection="column" width={Math.max(20, Math.min(56, ancho - anchoG - 3))}>
-                        <Text wrap="truncate-end"><Text color={f.color} bold>{c.hash.slice(0, 7)}</Text><Text dimColor>  {c.autor} · {haceFecha(c.fecha, ahora)} ago</Text></Text>
-                        <Text wrap="wrap">{recortar(c.asunto, 160)}</Text>
-                        <Text wrap="truncate-end">
-                          {c.archivos !== undefined ? <Text dimColor>{c.archivos} file{c.archivos === 1 ? '' : 's'}  </Text> : <Text dimColor>no file changes  </Text>}
-                          {c.mas !== undefined ? <Text color="success">+{c.mas} </Text> : null}
-                          {c.menos !== undefined ? <Text color="error">−{c.menos}</Text> : null}
-                        </Text>
-                        <Text wrap="truncate-end" dimColor>{c.padres.length > 1 ? `merge of ${c.padres.map(p => p.slice(0, 7)).join(' + ')}` : c.sinPush ? 'not pushed yet' : c.refs.length ? c.refs.join(', ') : 'click for diff'}</Text>
+                    {f.antes ? <Box flexDirection="row">{lineas(f.antes, `ha-${c.hash}`)}</Box> : null}
+                    <Box flexDirection="row" hover={{ scope: `hc-${c.hash}`, backgroundColor: '#2a2f3a' }}>
+                      {lineas(f.nodo, `hn-${c.hash}`)}
+                      <Box width={anchoTxt} flexShrink={1}>
+                        <Button key={`hb-${c.hash}`} plain hover={{ scope: `hc-${c.hash}` }} onPress={() => {
+                          void update($, detalleCommit, () => null)
+                          void update($, seleccion, () => ({ tipo: 'hist', id: c.hash }))
+                          void cargarCommit($, g.raiz, c.hash)
+                        }}>
+                          <Text wrap="truncate-end">
+                            {refs.map(r => <Text key={`e-${r.n}`}>{etiqueta(r, f.color)} </Text>)}
+                            <Text>{recortar(c.asunto, lugar)}</Text>
+                            <Text color="subtle"> {haceFecha(c.fecha, ahora)}</Text>
+                          </Text>
+                        </Button>
                       </Box>
                     </Box>
-                    {f.despues ? dibujar(f.despues, `hd-${c.hash}`) : null}
+                    {f.despues ? <Box flexDirection="row">{lineas(f.despues, `hd-${c.hash}`)}</Box> : null}
                   </Box>
                 )
               })}
+              {/* Detalles fijos abajo: muestran el commit que tiene el mouse encima */}
+              <Box marginTop={1} borderStyle="round" borderColor="subtle" paddingX={1} height={6} flexDirection="column">
+                <Text dimColor>hover a commit for details · click it for the diff</Text>
+                {hist.map(c => {
+                  const color = filas[hist.indexOf(c)]?.color ?? 'claude'
+                  return (
+                    <Box key={`hx-${c.hash}`} position="absolute" top={0} left={0} width={Math.max(10, ancho - 4)} height={4}
+                      display="none" hover={{ scope: `hc-${c.hash}`, display: 'flex' }} backgroundColor="#1b1f27" flexDirection="column">
+                      <Text wrap="truncate-end"><Text color={color} bold>{c.hash.slice(0, 7)}</Text><Text dimColor>  {c.autor} · {haceFecha(c.fecha, ahora)} ago</Text></Text>
+                      <Text wrap="truncate-end" bold>{c.asunto}</Text>
+                      <Text wrap="truncate-end">
+                        {c.archivos !== undefined ? <Text dimColor>{c.archivos} file{c.archivos === 1 ? '' : 's'}  </Text> : <Text dimColor>no file changes  </Text>}
+                        {c.mas !== undefined ? <Text color="success">+{c.mas} </Text> : null}
+                        {c.menos !== undefined ? <Text color="error">−{c.menos}</Text> : null}
+                        {c.sinPush ? <Text color="warning">  not pushed</Text> : null}
+                      </Text>
+                      <Text wrap="truncate-end" dimColor>
+                        {c.padres.length > 1 ? `merge of ${c.padres.map(p => p.slice(0, 7)).join(' + ')}` : c.refs.length ? c.refs.map(r => r.n + (r.sync ? ' (synced)' : '')).join(', ') : ''}
+                      </Text>
+                    </Box>
+                  )
+                })}
+              </Box>
             </Box>
           )
         })() : null}

@@ -29,7 +29,8 @@ export type Commit = {
   autor: string
   fecha: number
   asunto: string
-  refs: string[]
+  // Ramas y tags que apuntan al commit; `remota` es la que está solo en el remoto
+  refs: { t: 'head' | 'rama' | 'remota' | 'tag' | 'suelto'; n: string; sync?: boolean }[]
   sinPush: boolean
   archivos?: number
   mas?: number
