@@ -5,7 +5,7 @@ Dos mods para [Claude Code](https://claude.com/claude-code): uno para ver el con
 | Mod | Qué hace |
 |---|---|
 | [`estado-uso`](./estado-uso) | Línea de estado bajo el prompt: modelo, límites 5h / 7d, contexto, agentes y duración |
-| [`panel-sesion`](./panel-sesion) | Panel lateral con los archivos y comandos de la sesión, más git status / diff / commit / push |
+| [`panel-sesion`](./panel-sesion) | Panel lateral con los archivos y comandos de la sesión, git status / diff / commit / push y gráfico de ramas |
 
 ---
 
@@ -48,6 +48,14 @@ Si el directorio está dentro de un repo, el panel muestra:
 - Las acciones **commit** (`c`), **pull** (`p`), **push** (`u`) y **fetch** (`f`). Si la rama no tiene remoto, el push la publica en `origin`.
 - **Mensaje de commit automático**: Haiku lee el diff staged y propone una línea con el mismo estilo de tus últimos commits.
 - Si hay un merge en curso, te deja abortarlo.
+
+### Historial de ramas
+Al final del panel hay un gráfico del historial, parecido al de VS Code:
+- Los últimos 40 commits de todas las ramas, cada rama en un carril de color, con los merges y bifurcaciones dibujados.
+- Al lado de cada commit, la rama actual como chip, el resto de las ramas, las remotas (apagadas) y los tags (`◆`).
+- Los commits sin pushear con `○` en vez de `●`.
+- Al pasar el mouse por un commit, un recuadro abajo muestra el hash, autor, fecha, mensaje y archivos `+/−`.
+- Con click se abre el diff de cada archivo. `y` copia el hash y `b` vuelve.
 
 ### Comandos
 - `/panel` muestra u oculta el panel.

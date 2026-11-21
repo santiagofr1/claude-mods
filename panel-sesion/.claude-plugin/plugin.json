@@ -1,1 +1,1 @@
-{ "name": "panel-sesion", "version": "0.3.0", "description": "Panel lateral: git status/diff en repos, archivos y comandos de la sesión con marcar como visto", "types": "./types/index.d.ts" }
+{ "name": "panel-sesion", "version": "0.4.0", "description": "Panel lateral: git status/diff, gráfico de ramas, y archivos y comandos de la sesión con marcar como visto", "types": "./types/index.d.ts" }
