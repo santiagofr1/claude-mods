@@ -9,7 +9,7 @@ export type Comando = {
   stderr?: string
   t?: number
 }
-export type Seleccion = { tipo: 'archivo' | 'comando' | 'git' | 'commit'; id: string } | null
+export type Seleccion = { tipo: 'archivo' | 'comando' | 'git' | 'commit' | 'hist'; id: string } | null
 export type GitArchivo = { ruta: string; x: string; y: string; mas?: number; menos?: number }
 export type GitInfo = {
   raiz: string
@@ -22,6 +22,20 @@ export type GitInfo = {
   enMerge: boolean
 }
 export type GitAccion = { accion: string; estado: 'corre' | 'ok' | 'error' | 'conflicto'; texto: string } | null
+// Un commit del historial, para el gráfico de ramas
+export type Commit = {
+  hash: string
+  padres: string[]
+  autor: string
+  fecha: number
+  asunto: string
+  refs: string[]
+  sinPush: boolean
+  archivos?: number
+  mas?: number
+  menos?: number
+}
+export type CommitDetalle = { hash: string; cuerpo: string; archivos: { ruta: string; patch: string }[] } | null
 export type GitDetalle = { ruta: string; staged: string; trabajo: string; nuevo: boolean } | null
 
 declare module 'claude-code' {
@@ -37,6 +51,8 @@ declare module 'claude-code' {
       detalle: GitDetalle
       confirmar: string | null
       accion: GitAccion
+      historial: Commit[]
+      detalleCommit: CommitDetalle
     }
   }
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, EngineInterface } from 'claude-code'
 
-import type { Archivo, Cambio, Comando, GitAccion, GitArchivo, GitDetalle, GitInfo, Seleccion } from '../types'
+import type { Archivo, Cambio, Comando, Commit, CommitDetalle, GitAccion, GitArchivo, GitDetalle, GitInfo, Seleccion } from '../types'
 
 const PANEL = 'panel-sesion'
 const TITULO = 'Session'
@@ -18,6 +18,8 @@ const git = atom({ plugin: 'panel-sesion', key: 'git' } as const, null as GitInf
 const confirmar = atom({ plugin: 'panel-sesion', key: 'confirmar' } as const, null as string | null)
 const accion = atom({ plugin: 'panel-sesion', key: 'accion' } as const, null as GitAccion)
 const detalle = atom({ plugin: 'panel-sesion', key: 'detalle' } as const, null as GitDetalle)
+const historial = atom({ plugin: 'panel-sesion', key: 'historial' } as const, [] as Commit[])
+const detalleCommit = atom({ plugin: 'panel-sesion', key: 'detalleCommit' } as const, null as CommitDetalle)
 
 type Hunk = { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[] }
 
@@ -144,6 +146,7 @@ async function refrescarGit($: EngineInterface) {
     aplicar(ns.stdout, info.modificados)
     aplicar(nc.stdout, info.staged)
     await update($, git, () => info)
+    await cargarHistorial($, r)
   } catch {
     // git no disponible: el panel sigue en modo sesión
   } finally {
@@ -230,6 +233,171 @@ async function aGitignore($: EngineInterface, raiz: string, ruta: string) {
 function soloHunks(d: string) {
   const i = d.indexOf('\n@@')
   return i < 0 ? (d.startsWith('@@') ? d : '') : d.slice(i + 1).replace(/\n$/, '')
+}
+
+// ───────────── historial de ramas ─────────────
+
+const MAX_COMMITS = 40
+// Un color por carril, como el gráfico de VS Code
+const COLORES = ['#4fc1ff', '#f97583', '#b392f0', '#85e89d', '#ffab70', '#f692ce', '#79b8ff', '#ffea7f']
+
+type Celda = { ch: string; color?: string; bold?: boolean }
+type FilaGrafo = { antes: Celda[] | null; nodo: Celda[]; despues: Celda[] | null; color: string }
+
+async function cargarHistorial($: EngineInterface, raiz: string) {
+  const opts = { cwd: raiz, timeoutMs: 10000 }
+  const [log, remotos] = await Promise.all([
+    $.process.run(['git', 'log', '--branches', '--remotes', '--tags', 'HEAD', '--topo-order', '-n', String(MAX_COMMITS),
+      '--format=%x1e%H%x1f%P%x1f%an%x1f%at%x1f%s%x1f%D', '--shortstat'], opts),
+    $.process.run(['git', 'remote'], opts),
+  ])
+  if (log.exitCode !== 0) { await update($, historial, () => []); return }
+  // Sin remoto no tiene sentido marcar "sin pushear"
+  let sinPush = new Set<string>()
+  if (remotos.stdout.trim()) {
+    const rl = await $.process.run(['git', 'rev-list', '--branches', '--not', '--remotes'], opts)
+    sinPush = new Set(rl.stdout.split('\n').filter(Boolean))
+  }
+  const commits: Commit[] = []
+  for (const reg of log.stdout.split('\x1e')) {
+    if (!reg.trim()) continue
+    const [cab = '', ...resto] = reg.split('\n')
+    const [hash = '', padres = '', autor = '', fecha = '0', asunto = '', refs = ''] = cab.split('\x1f')
+    const st = resto.join(' ')
+    const c: Commit = {
+      hash,
+      padres: padres.split(' ').filter(Boolean),
+      autor,
+      fecha: Number(fecha) * 1000,
+      asunto,
+      refs: refs.split(', ').map(r => r.trim()).filter(r => r && r !== 'origin/HEAD' && !r.endsWith('/HEAD')),
+      sinPush: sinPush.has(hash),
+    }
+    const n = /(\d+) files? changed/.exec(st)
+    if (n) {
+      c.archivos = Number(n[1])
+      c.mas = Number(/(\d+) insertion/.exec(st)?.[1] ?? 0)
+      c.menos = Number(/(\d+) deletion/.exec(st)?.[1] ?? 0)
+    }
+    commits.push(c)
+  }
+  await update($, historial, () => commits)
+}
+
+async function cargarCommit($: EngineInterface, raiz: string, hash: string) {
+  const r = await $.process.run(['git', 'show', '--no-color', '--format=%B%x1e', hash], { cwd: raiz, timeoutMs: 15000 })
+  const [cuerpo = '', diff = ''] = r.stdout.split('\x1e')
+  const archivos = diff.split(/\n(?=diff --git )/).filter(b => b.startsWith('diff --git') || b.trim().startsWith('diff --git')).map(b => {
+    const bloque = b.trim()
+    const ruta = /^diff --git a\/.+? b\/(.+)$/m.exec(bloque)?.[1] ?? '?'
+    return { ruta, patch: cortar(soloHunks(bloque)) }
+  })
+  await update($, detalleCommit, () => ({ hash, cuerpo: cuerpo.trim(), archivos: archivos.slice(0, 40) }))
+}
+
+// Arma los carriles: cada commit en su columna, con las uniones (antes) y las bifurcaciones (después)
+function armarGrafo(commits: readonly Commit[]): FilaGrafo[] {
+  const carriles: (string | null)[] = []
+  const colorDe: string[] = []
+  let siguiente = 0
+  const nuevoColor = () => COLORES[siguiente++ % COLORES.length] ?? '#4fc1ff'
+  const libre = () => {
+    const i = carriles.indexOf(null)
+    if (i >= 0) return i
+    carriles.push(null)
+    return carriles.length - 1
+  }
+  const vacia = (n: number): Celda[] => Array.from({ length: n * 2 }, () => ({ ch: ' ' }))
+  // Une la columna `col` con cada destino con una línea horizontal
+  const conectar = (fila: Celda[], col: number, destinos: { t: number; ch: string }[], sigue: boolean) => {
+    let der = false
+    let izq = false
+    for (const { t, ch } of destinos) {
+      const color = colorDe[t]
+      const [a, b] = t > col ? [col, t] : [t, col]
+      for (let x = a * 2 + 1; x < b * 2; x++) {
+        const c = fila[x]
+        fila[x] = { ch: c && c.ch === '│' ? '┼' : '─', color }
+      }
+      fila[t * 2] = { ch, color }
+      if (t > col) der = true
+      else izq = true
+    }
+    const ch = der && izq ? '┼' : der ? (sigue ? '├' : '╰') : sigue ? '┤' : '╯'
+    fila[col * 2] = { ch, color: colorDe[col] }
+  }
+
+  const filas: FilaGrafo[] = []
+  for (const c of commits) {
+    let col = carriles.indexOf(c.hash)
+    if (col < 0) {
+      col = libre()
+      carriles[col] = c.hash
+      colorDe[col] = nuevoColor()
+    }
+    const antes = carriles.slice()
+    const color = colorDe[col] ?? '#4fc1ff'
+
+    // Ramas que terminan en este commit (salieron de acá): se juntan arriba del nodo
+    const cierran = antes.flatMap((h, i) => (h === c.hash && i !== col ? [i] : []))
+    let filaAntes: Celda[] | null = null
+    if (cierran.length) {
+      filaAntes = vacia(antes.length)
+      antes.forEach((h, i) => { if (h) filaAntes![i * 2] = { ch: '│', color: colorDe[i] } })
+      conectar(filaAntes, col, cierran.map(t => ({ t, ch: t > col ? '╯' : '╰' })), true)
+      for (const i of cierran) carriles[i] = null
+    }
+
+    const nodo = vacia(antes.length)
+    carriles.forEach((h, i) => { if (h) nodo[i * 2] = { ch: '│', color: colorDe[i] } })
+    nodo[col * 2] = { ch: c.sinPush ? '○' : '●', color, bold: true }
+
+    // Padres: el primero sigue en el carril, los demás (merge) abren o se unen a otro carril
+    carriles[col] = c.padres[0] ?? null
+    const abren: { t: number; ch: string }[] = []
+    for (const p of c.padres.slice(1)) {
+      let t = carriles.indexOf(p)
+      if (t >= 0 && t !== col) abren.push({ t, ch: t > col ? '┤' : '├' })
+      else {
+        t = libre()
+        carriles[t] = p
+        colorDe[t] = nuevoColor()
+        abren.push({ t, ch: t > col ? '╮' : '╭' })
+      }
+    }
+    let filaDespues: Celda[] | null = null
+    if (abren.length) {
+      filaDespues = vacia(carriles.length)
+      carriles.forEach((h, i) => { if (h) filaDespues![i * 2] = { ch: '│', color: colorDe[i] } })
+      conectar(filaDespues, col, abren, carriles[col] !== null)
+    }
+    while (carriles.length && carriles[carriles.length - 1] === null) carriles.pop()
+    filas.push({ antes: filaAntes, nodo, despues: filaDespues, color })
+  }
+  return filas
+}
+
+// Junta celdas seguidas del mismo color para dibujar menos nodos
+function tramos(celdas: Celda[], ancho: number) {
+  const out: Celda[] = []
+  for (const c of celdas.slice(0, ancho)) {
+    const u = out[out.length - 1]
+    if (u && u.color === c.color && u.bold === c.bold) u.ch += c.ch
+    else out.push({ ...c })
+  }
+  const largo = celdas.slice(0, ancho).length
+  if (largo < ancho) out.push({ ch: ' '.repeat(ancho - largo) })
+  return out
+}
+
+function haceFecha(ms: number, ahora: number) {
+  const m = Math.max(0, Math.round((ahora - ms) / 60000))
+  if (m < 1) return 'now'
+  if (m < 60) return `${m}m`
+  const h = Math.round(m / 60)
+  if (h < 24) return `${h}h`
+  const d = Math.round(h / 24)
+  return d < 30 ? `${d}d` : `${Math.round(d / 30)}mo`
 }
 
 // ───────────── registro ─────────────
@@ -327,7 +495,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANEL }, async ($, e) => {
     const { Box, Text, Button, Code, Input } = $.ui.resolve(e)
-    const [lista, cmds, nLeidos, sel, vis, abiertas, g, det, cwd, ahora, conf, act] = await Promise.all([
+    const [lista, cmds, nLeidos, sel, vis, abiertas, g, det, cwd, ahora, conf, act, hist, detCommit] = await Promise.all([
       read($, archivos),
       read($, comandos),
       read($, leidos),
@@ -340,6 +508,8 @@ export const register: Register = on => {
       $.clock.now(),
       read($, confirmar),
       read($, accion),
+      read($, historial),
+      read($, detalleCommit),
     ])
     const ancho = Math.max(24, e.props.bodyColumns)
     const visto = new Set(vis)
@@ -622,6 +792,39 @@ export const register: Register = on => {
       }
     }
 
+    // ── Un commit del historial ──
+    if (sel?.tipo === 'hist' && g) {
+      const c = hist.find(x => x.hash === sel.id)
+      const dc = detCommit?.hash === sel.id ? detCommit : null
+      return (
+        <Box flexDirection="column">
+          <Box borderStyle="round" borderColor="#b392f0" paddingX={1} flexDirection="column">
+            <Text wrap="truncate-end">
+              {chip(sel.id.slice(0, 7), '#b392f0')}
+              <Text bold>  {c?.asunto ?? ''}</Text>
+            </Text>
+            {c ? <Text dimColor>{c.autor} · {haceFecha(c.fecha, ahora)} ago{c.archivos !== undefined ? ` · ${c.archivos} files ` : ''}{c.mas !== undefined ? <Text color="success">+{c.mas} </Text> : null}{c.menos !== undefined ? <Text color="error">−{c.menos}</Text> : null}</Text> : null}
+            {c && c.refs.length ? <Text wrap="truncate-end">{c.refs.map(r => `[${r}]`).join(' ')}</Text> : null}
+          </Box>
+          {dc ? (
+            <Box flexDirection="column">
+              {dc.cuerpo.includes('\n') ? <Box marginTop={1}><Text dimColor>{dc.cuerpo}</Text></Box> : null}
+              {dc.archivos.map(f => (
+                <Box key={`hf-${f.ruta}`} marginTop={1} flexDirection="column">
+                  {regla('◆', f.ruta)}
+                  {f.patch ? <Code source={f.patch} format="diff" path={f.ruta} language={lenguaje(f.ruta)} /> : <Text dimColor>  (binary or no changes)</Text>}
+                </Box>
+              ))}
+            </Box>
+          ) : <Text dimColor>loading…</Text>}
+          <Box marginTop={1} flexDirection="row" gap={1}>
+            {volverBtn}
+            <Button key="copiar" hotkey="y" onPress={press => $.ui.copy({ text: sel.id, surface: press.surface })}>copy hash</Button>
+          </Box>
+        </Box>
+      )
+    }
+
     // ── Lista ──
     const filaArchivo = (a: Archivo) => {
       const id = `a:${a.ruta}`
@@ -802,6 +1005,64 @@ export const register: Register = on => {
           {csHistorial.length > 0 ? plegable('historial', 'history', csHistorial.length) : null}
           {abierta.has('historial') ? csHistorial.map(filaComando) : null}
         </Box>
+
+        {g && hist.length > 0 ? (() => {
+          const filas = armarGrafo(hist)
+          const anchoG = Math.min(16, Math.max(2, ...filas.map(f => Math.max(f.nodo.length, f.antes?.length ?? 0, f.despues?.length ?? 0))))
+          const dibujar = (celdas: Celda[], k: string) => (
+            <Text key={k}>{tramos(celdas, anchoG).map((t, i) => <Text key={`${k}-${i}`} color={t.color} bold={t.bold}>{t.ch}</Text>)}</Text>
+          )
+          const etiqueta = (r: string, color: string) => {
+            if (r.startsWith('HEAD -> ')) return <Text key={r} color="inverseText" backgroundColor={color} bold>{` ${r.slice(8)} `}</Text>
+            if (r.startsWith('tag: ')) return <Text key={r} color="warning" bold>{`◆${r.slice(5)}`}</Text>
+            if (r === 'HEAD') return <Text key={r} color="inverseText" backgroundColor="warning" bold> HEAD </Text>
+            if (r.includes('/')) return <Text key={r} color={color} dimColor>{`☁${r}`}</Text>
+            return <Text key={r} color={color} bold>{`[${r}]`}</Text>
+          }
+          return (
+            <Box marginTop={1} flexDirection="column">
+              {regla('HISTORY', `${hist.length} commits · ○ not pushed`)}
+              {filas.map((f, i) => {
+                const c = hist[i]!
+                const refsTxt = c.refs.join(' ').length + c.refs.length * 2
+                const lugar = Math.max(6, ancho - anchoG - refsTxt - 6)
+                // La tarjeta sale abajo, salvo en las últimas filas, donde sale arriba
+                const arriba = i > filas.length - 8
+                return (
+                  <Box key={`h-${c.hash}`} flexDirection="column">
+                    {f.antes ? dibujar(f.antes, `ha-${c.hash}`) : null}
+                    <Box key={`hr-${c.hash}`} flexDirection="row" hover={{ backgroundColor: '#2a2f3a' }}>
+                      {dibujar(f.nodo, `hn-${c.hash}`)}
+                      <Button key={`hb-${c.hash}`} onPress={() => {
+                        void update($, detalleCommit, () => null)
+                        void update($, seleccion, () => ({ tipo: 'hist', id: c.hash }))
+                        void cargarCommit($, g.raiz, c.hash)
+                      }}>
+                        <Text wrap="truncate-end">
+                          {c.refs.map(r => <Text key={`e-${r}`}>{etiqueta(r, f.color)} </Text>)}
+                          <Text>{recortar(c.asunto, lugar)}</Text>
+                          <Text color="subtle"> {haceFecha(c.fecha, ahora)}</Text>
+                        </Text>
+                      </Button>
+                      <Box position="absolute" top={arriba ? -7 : 1} left={anchoG + 2} display="none" hover={{ display: 'flex' }}
+                        borderStyle="round" borderColor={f.color} backgroundColor="#1b1f27" paddingX={1} flexDirection="column" width={Math.max(20, Math.min(56, ancho - anchoG - 3))}>
+                        <Text wrap="truncate-end"><Text color={f.color} bold>{c.hash.slice(0, 7)}</Text><Text dimColor>  {c.autor} · {haceFecha(c.fecha, ahora)} ago</Text></Text>
+                        <Text wrap="wrap">{recortar(c.asunto, 160)}</Text>
+                        <Text wrap="truncate-end">
+                          {c.archivos !== undefined ? <Text dimColor>{c.archivos} file{c.archivos === 1 ? '' : 's'}  </Text> : <Text dimColor>no file changes  </Text>}
+                          {c.mas !== undefined ? <Text color="success">+{c.mas} </Text> : null}
+                          {c.menos !== undefined ? <Text color="error">−{c.menos}</Text> : null}
+                        </Text>
+                        <Text wrap="truncate-end" dimColor>{c.padres.length > 1 ? `merge of ${c.padres.map(p => p.slice(0, 7)).join(' + ')}` : c.sinPush ? 'not pushed yet' : c.refs.length ? c.refs.join(', ') : 'click for diff'}</Text>
+                      </Box>
+                    </Box>
+                    {f.despues ? dibujar(f.despues, `hd-${c.hash}`) : null}
+                  </Box>
+                )
+              })}
+            </Box>
+          )
+        })() : null}
 
         <Box marginTop={1}>
           <Button key="ocultar" hotkey="h" onPress={() => { void $.store.set('visible', false); void $.ui.close({ id: PANEL }) }}>
